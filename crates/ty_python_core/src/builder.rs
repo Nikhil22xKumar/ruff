@@ -133,6 +133,12 @@ impl BoolOpSnapshot {
     }
 }
 
+#[derive(Clone, Copy)]
+enum StatementOrExpression<'ast> {
+    Statement(&'ast ast::Stmt),
+    Expression(&'ast ast::Expr),
+}
+
 pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     // Builder state
     db: &'db dyn Db,
@@ -1781,51 +1787,67 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         expression
     }
 
-    fn add_standalone_statement(&mut self, statement_node: &ast::Stmt) -> Statement<'db> {
+    fn add_standalone_statement(
+        &mut self,
+        stmt_or_expr: StatementOrExpression<'ast>,
+    ) -> Statement<'db> {
         // Avoid allocating a salsa ingredient if the statement represents an existing
         // definition or standalone expression.
-        let statement = match statement_node {
-            ast::Stmt::FunctionDef(function) => Some(Statement::Definition(
-                self.expect_single_definition(function),
-            )),
-            ast::Stmt::ClassDef(class) => {
+        let statement = match stmt_or_expr {
+            StatementOrExpression::Statement(ast::Stmt::FunctionDef(function)) => Some(
+                Statement::Definition(self.expect_single_definition(function)),
+            ),
+            StatementOrExpression::Statement(ast::Stmt::ClassDef(class)) => {
                 Some(Statement::Definition(self.expect_single_definition(class)))
             }
-            ast::Stmt::Expr(ast::StmtExpr { value, .. }) => {
+            StatementOrExpression::Statement(ast::Stmt::Expr(ast::StmtExpr { value, .. })) => {
                 Some(Statement::Expression(self.add_standalone_expression(value)))
             }
-            ast::Stmt::Assign(assign) => {
+            StatementOrExpression::Statement(ast::Stmt::Assign(assign)) => {
                 if let [ast::Expr::Name(name)] = &assign.targets[..] {
                     Some(Statement::Definition(self.expect_single_definition(name)))
                 } else {
                     None
                 }
             }
-            ast::Stmt::AnnAssign(assign) if assign.target.is_name_expr() => {
+            StatementOrExpression::Statement(ast::Stmt::AnnAssign(assign))
+                if assign.target.is_name_expr() =>
+            {
                 Some(Statement::Definition(self.expect_single_definition(assign)))
             }
-            ast::Stmt::AugAssign(assign) if assign.target.is_name_expr() => {
+            StatementOrExpression::Statement(ast::Stmt::AugAssign(assign))
+                if assign.target.is_name_expr() =>
+            {
                 Some(Statement::Definition(self.expect_single_definition(assign)))
             }
-            ast::Stmt::TypeAlias(alias) => {
+            StatementOrExpression::Statement(ast::Stmt::TypeAlias(alias)) => {
                 Some(Statement::Definition(self.expect_single_definition(alias)))
             }
             _ => None,
         };
 
-        let statement = if let Some(statement) = statement {
-            statement
-        } else {
-            Statement::Other(StatementInner::new(
-                self.db,
-                self.file,
-                self.current_scope(),
-                AstNodeRef::new(self.module, statement_node),
-            ))
+        let statement = match statement {
+            Some(statement) => statement,
+            None => match stmt_or_expr {
+                StatementOrExpression::Expression(expr) => {
+                    Statement::Expression(self.add_standalone_expression(expr))
+                }
+                StatementOrExpression::Statement(stmt) => Statement::Other(StatementInner::new(
+                    self.db,
+                    self.file,
+                    self.current_scope(),
+                    AstNodeRef::new(self.module, stmt),
+                )),
+            },
         };
 
-        self.statements_by_node
-            .insert(statement_node.into(), statement);
+        let statement_key = match stmt_or_expr {
+            StatementOrExpression::Statement(stmt) => StatementNodeKey::from(stmt),
+            StatementOrExpression::Expression(expr) => StatementNodeKey::from(expr),
+        };
+
+        self.statements_by_node.insert(statement_key, statement);
+
         statement
     }
 
@@ -2226,6 +2248,43 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     fn source_text(&self) -> &SourceText {
         self.source_text
             .get_or_init(|| source_text(self.db, self.file))
+    }
+
+    fn visit_standalone_stmt(&mut self, stmt_or_expr: StatementOrExpression<'ast>) {
+        self.push_statement(CurrentStatement::default());
+
+        match stmt_or_expr {
+            StatementOrExpression::Statement(stmt) => self.visit_stmt_impl(stmt),
+            StatementOrExpression::Expression(expr) => self.visit_expr(expr),
+        }
+
+        let current_statement = self.pop_statement();
+
+        if current_statement.lambda_expressions.is_empty()
+            && current_statement.collection_uses.is_empty()
+        {
+            return;
+        }
+
+        let standalone_statement = self.add_standalone_statement(stmt_or_expr);
+        for lambda in current_statement.lambda_expressions {
+            // The body of a lambda expression needs access to the `Callable` type
+            // context the lambda is being inferred with, and so any statement
+            // containing a lambda must be inferable as a standalone statement
+            // to avoid large scope-level cycles.
+            self.enclosing_lambda_statements
+                .insert(lambda.into(), standalone_statement);
+        }
+        for (definition, use_expression) in current_statement.collection_uses {
+            // The inferred element type of collection literal depends on uses
+            // of the collection in its containing scope, and so each use
+            // must be part of an standalone inferable statement to avoid
+            // large scope-level cycles.
+            self.uses_by_collection
+                .entry(definition)
+                .or_default()
+                .push((standalone_statement, use_expression));
+        }
     }
 
     fn visit_stmt_impl(&mut self, stmt: &'ast ast::Stmt) {
@@ -2757,7 +2816,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     }
                 };
 
-                self.visit_expr(&node.test);
+                self.visit_standalone_stmt(StatementOrExpression::Expression(&node.test));
                 let mut bool_op_snapshot = flow_snapshot(self, &node.test);
                 self.flow_restore(bool_op_snapshot.truthy());
                 let (mut last_predicate, mut last_narrowing_id) =
@@ -2874,7 +2933,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 
                 // Visit the test expression after creating loop headers, so that loop-back values
                 // are visible.
-                self.visit_expr(test);
+                self.visit_standalone_stmt(StatementOrExpression::Expression(test));
 
                 // Take the pre_loop snapshot after visiting the test expression, so that walrus
                 // bindings in the test (which are always evaluated at least once) remain visible
@@ -2941,7 +3000,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     optional_vars,
                 } in items
                 {
-                    self.visit_expr(context_expr);
+                    self.visit_standalone_stmt(StatementOrExpression::Expression(context_expr));
+
                     if let Some(optional_vars) = optional_vars.as_deref() {
                         let context_manager = self.add_standalone_expression(context_expr);
                         self.add_unpackable_assignment(
@@ -2971,7 +3031,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 debug_assert_eq!(&self.current_assignments, &[]);
 
                 let iter_expr = self.add_standalone_expression(iter);
-                self.visit_expr(iter);
+                self.visit_standalone_stmt(StatementOrExpression::Expression(iter));
 
                 self.record_ambiguous_reachability();
 
@@ -3032,7 +3092,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                 debug_assert_eq!(self.current_match_case, None);
 
                 let subject_expr = self.add_standalone_expression(subject);
-                self.visit_expr(subject);
+                self.visit_standalone_stmt(StatementOrExpression::Expression(subject));
                 if cases.is_empty() {
                     return;
                 }
@@ -3514,40 +3574,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 
 impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
     fn visit_stmt(&mut self, stmt: &'ast ast::Stmt) {
-        self.push_statement(CurrentStatement {
-            lambda_expressions: Vec::new(),
-            collection_uses: FxHashMap::default(),
-        });
-
-        self.visit_stmt_impl(stmt);
-
-        let current_statement = self.pop_statement();
-
-        if current_statement.lambda_expressions.is_empty()
-            && current_statement.collection_uses.is_empty()
-        {
-            return;
-        }
-
-        let standalone_statement = self.add_standalone_statement(stmt);
-        for lambda in current_statement.lambda_expressions {
-            // The body of a lambda expression needs access to the `Callable` type
-            // context the lambda is being inferred with, and so any statement
-            // containing a lambda must be inferable as a standalone statement
-            // to avoid large scope-level cycles.
-            self.enclosing_lambda_statements
-                .insert(lambda.into(), standalone_statement);
-        }
-        for (definition, use_expression) in current_statement.collection_uses {
-            // The inferred element type of collection literal depends on uses
-            // of the collection in its containing scope, and so each use
-            // must be part of an standalone inferable statement to avoid
-            // large scope-level cycles.
-            self.uses_by_collection
-                .entry(definition)
-                .or_default()
-                .push((standalone_statement, use_expression));
-        }
+        self.visit_standalone_stmt(StatementOrExpression::Statement(stmt));
     }
 
     fn visit_keyword(&mut self, keyword: &'ast ast::Keyword) {
@@ -3736,6 +3763,7 @@ impl<'ast> Visitor<'ast> for SemanticIndexBuilder<'_, 'ast> {
                 body, test, orelse, ..
             }) => {
                 self.visit_expr(test);
+
                 let pre_if = self.flow_snapshot();
                 let (predicate, predicate_id) = self.record_expression_narrowing_constraint(test);
                 let reachability_constraint = self.record_reachability_constraint(predicate);
@@ -4166,6 +4194,7 @@ impl<'ast> From<&'ast ast::ExprNamed> for CurrentAssignment<'ast, '_> {
     }
 }
 
+#[derive(Default)]
 struct CurrentStatement<'ast, 'db> {
     /// A list of lambda expressions contained in this statement.
     lambda_expressions: Vec<&'ast ast::ExprLambda>,

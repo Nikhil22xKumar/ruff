@@ -12,6 +12,10 @@ use salsa;
 ///
 /// Many statements can be treated directly as definitions or expressions,
 /// and so do not require a separate Salsa allocation.
+///
+// Note that standalone "statements" are not necessarily tied to AST statements.
+// For example, the test expression of an if statement is recorded as an individual
+// standalone statement, as opposed to the entire if statement block.
 #[derive(
     Clone, Copy, Debug, Eq, Hash, PartialEq, salsa::Supertype, salsa::Update, get_size2::GetSize,
 )]
@@ -63,6 +67,12 @@ pub struct StatementNodeKey(NodeKey);
 
 impl From<&ast::Stmt> for StatementNodeKey {
     fn from(node: &ast::Stmt) -> Self {
+        Self(NodeKey::from_node(node))
+    }
+}
+
+impl From<&ast::Expr> for StatementNodeKey {
+    fn from(node: &ast::Expr) -> Self {
         Self(NodeKey::from_node(node))
     }
 }
