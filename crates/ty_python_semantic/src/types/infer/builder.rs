@@ -5212,6 +5212,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     },
                 ) => {
                     let mut expected_fields = FxHashMap::default();
+                    let mut required_fields = FxHashSet::default();
                     for (overload, binding) in &overloads_with_binding {
                         let argument_index = if binding.bound_type.is_some() {
                             argument_index + 1
@@ -5232,6 +5233,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                             if let Some(name) = parameter.keyword_name() {
                                 let annotated_type = parameter.annotated_type();
+                                if parameter.default_type().is_none() {
+                                    required_fields.insert(name.clone());
+                                }
                                 expected_fields
                                     .entry(name.clone())
                                     .and_modify(|existing| {
@@ -5251,6 +5255,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             self.expression_type(value),
                             keyword,
                             Some(&expected_fields),
+                            Some(&required_fields),
                         )
                     {
                         argument_types.insert(TypeContext::default(), ty);
@@ -7058,6 +7063,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         argument_type: Type<'db>,
         keyword: &ast::Keyword,
         expected_fields: Option<&FxHashMap<Name, Type<'db>>>,
+        required_fields: Option<&FxHashSet<Name>>,
     ) -> Option<Type<'db>> {
         let db = self.db();
         let file_scope_id = self.scope().file_scope_id(db);
@@ -7109,13 +7115,31 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return None;
         }
 
-        if let Some(expected_fields) = expected_fields
-            && expected_fields
-                .keys()
-                .all(|expected| elements.iter().any(|(name, _)| name == expected))
+        let has_valid_keyword_keys =
+            argument_type
+                .unpack_keys_and_items(db)
+                .is_none_or(|(key_ty, _)| {
+                    key_ty
+                        .when_assignable_to(
+                            db,
+                            KnownClass::Str.to_instance(db),
+                            &ConstraintSetBuilder::new(),
+                            InferableTypeVars::None,
+                        )
+                        .is_always_satisfied(db)
+                });
+
+        if has_valid_keyword_keys
+            && expected_fields.is_some()
+            && required_fields.is_some_and(|required| {
+                required
+                    .iter()
+                    .all(|expected| elements.iter().any(|(name, _)| name == expected))
+            })
         {
             let schema = elements
-                .into_iter()
+                .iter()
+                .cloned()
                 .map(|(name, ty)| {
                     (
                         name,
@@ -7123,9 +7147,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     )
                 })
                 .collect::<TypedDictSchema<'db>>();
-            return Some(Type::TypedDict(TypedDictType::from_schema_items(
-                db, schema,
-            )));
+            let typed_dict = Type::TypedDict(TypedDictType::from_schema_items(db, schema));
+
+            return Some(IntersectionType::from_elements(
+                db,
+                [argument_type, typed_dict],
+            ));
         }
 
         // Synthesize overloads for `__getitem__` based on known dictionary elements.
@@ -7215,7 +7242,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     self.store_expression_type(argument, ty);
                 } else if let ast::ArgOrKeyword::Keyword(keyword) = arg_or_keyword
                     && keyword.arg.is_none()
-                    && let Some(narrowed) = self.try_narrow_dict_kwargs(ty, keyword, None)
+                    && let Some(narrowed) = self.try_narrow_dict_kwargs(ty, keyword, None, None)
                 {
                     return narrowed;
                 }

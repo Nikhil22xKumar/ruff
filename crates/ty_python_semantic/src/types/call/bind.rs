@@ -5223,6 +5223,20 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         if let Some(unpacked_keys) =
             extract_unpacked_typed_dict_keys_from_value_type(self.db, argument_type)
         {
+            if let KeywordUnpackKeyTypeCheck::Invalid(provided_ty) =
+                validate_keyword_unpack_key_type(
+                    self.db,
+                    constraints,
+                    argument_type,
+                    self.inferable_typevars,
+                )
+            {
+                self.errors.push(BindingError::InvalidKeyType {
+                    argument_index: adjusted_argument_index,
+                    provided_ty,
+                });
+            }
+
             let matched_parameters = self.argument_matches[argument_index]
                 .parameters
                 .iter()

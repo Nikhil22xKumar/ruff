@@ -1734,6 +1734,18 @@ def invalid_headers() -> None:
     }
     with_headers(**kwargs)  # error: [invalid-argument-type]
 
+def with_optional_headers(*, extra_headers: Mapping[str, str] | None = None, other: str = "") -> None: ...
+def invalid_headers_with_optional() -> None:
+    kwargs: dict[str, Any] = {
+        "extra_headers": {Header.REQUEST_ID: 1},
+    }
+    with_optional_headers(**kwargs)  # error: [invalid-argument-type]
+
+def takes_x(*, x: int) -> None: ...
+def invalid_key_type() -> None:
+    kwargs: dict[int | str, Any] = {"x": 1, 1: 2}
+    takes_x(**kwargs)  # error: [invalid-argument-type]
+
 class InputMessage(TypedDict):
     role: Literal["user"]
     content: str
@@ -1756,5 +1768,13 @@ def ok_out_of_order() -> None:
         "second": "s",
         "third": True,
     }
+    out_of_order(**kwargs)
+
+class OutOfOrderKwargs(TypedDict):
+    first: int
+    second: str
+    third: bool
+
+def ok_typed_dict_out_of_order(kwargs: OutOfOrderKwargs) -> None:
     out_of_order(**kwargs)
 ```
